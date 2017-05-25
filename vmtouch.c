@@ -564,6 +564,9 @@ void vmtouch_file(char *path) {
     if (o_verbose) printf("Evicting %s\n", path);
 
 #if defined(__linux__) || defined(__hpux)
+    // flushes all data buffers of the file to disk 
+    if (fdatasync(fd)<0)
+      warning("unable to fdatasync file %s (%s)", path, strerror(errno));
     if (posix_fadvise(fd, offset, len_of_range, POSIX_FADV_DONTNEED))
       warning("unable to posix_fadvise file %s (%s)", path, strerror(errno));
 #elif defined(__FreeBSD__) || defined(__sun__) || defined(__APPLE__)
