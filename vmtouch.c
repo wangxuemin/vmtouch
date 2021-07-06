@@ -37,7 +37,7 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ***********************************************************************/
 
 
-#define VMTOUCH_VERSION "1.3.0"
+#define VMTOUCH_VERSION "1.3.1"
 #define RESIDENCY_CHART_WIDTH 60
 #define CHART_UPDATE_INTERVAL 0.1
 #define MAX_CRAWL_DEPTH 1024
@@ -69,6 +69,7 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stdarg.h>
 #include <stdint.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/select.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -90,6 +91,8 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 // Used to find size of block devices
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+// Used to check kernal version to know if mincore reports correctly
+#include <sys/utsname.h>
 #endif
 
 /*
@@ -136,6 +139,7 @@ int o_ignorehardlinkeduplictes=0;
 size_t o_max_file_size=SIZE_MAX;
 int o_wait=0;
 static char *o_batch = NULL;
+static char *o_pidfile = NULL;
 int o_0_delim = 0;
 
 
@@ -177,6 +181,7 @@ void usage() {
   printf("  -b <list file> get files or directories from the list file\n");
   printf("  -0 in batch mode (-b) separate paths with NUL byte instead of newline\n");
   printf("  -w wait until all pages are locked (only useful together with -d)\n");
+  printf("  -P <pidfile> write a pidfile (only useful together with -l or -L)\n");
   printf("  -v verbose\n");
   printf("  -q quiet\n");
   exit(1);
@@ -466,7 +471,37 @@ void print_page_residency_chart(FILE *out, char *mincore_array, int64_t pages_in
 }
 
 
+#ifdef __linux__
+// check if mincore will report correctly, due side-channel vulnerabilities
+// from 5.2+ it only reports if process has write permission to the file
+// https://lwn.net/Articles/778437/
+static int can_do_mincore(struct stat *st) {
 
+  struct utsname utsinfo;
+  if (uname(&utsinfo) == 0) {
+    unsigned long ver[16];
+    int i=0;
+    char *p = utsinfo.release;
+    while (*p) {
+      if (isdigit(*p)) {
+          ver[i] = strtol(p, &p, 10);
+          i++;
+      } else {
+          p++;
+      }
+    }
+    // kernal < 5.2
+    if (ver[0]<5||ver[1]<2)
+      return 1;
+  }
+
+  uid_t uid = getuid();
+  return st->st_uid == uid ||
+         (st->st_gid == getgid() && (st->st_mode&S_IWGRP)) ||
+         (st->st_mode&S_IWOTH) ||
+         uid == 0;
+}
+#endif
 
 
 void vmtouch_file(char *path) {
@@ -564,9 +599,6 @@ void vmtouch_file(char *path) {
     if (o_verbose) printf("Evicting %s\n", path);
 
 #if defined(__linux__) || defined(__hpux)
-    // flushes all data buffers of the file to disk 
-    if (fdatasync(fd)<0)
-      warning("unable to fdatasync file %s (%s)", path, strerror(errno));
     if (posix_fadvise(fd, offset, len_of_range, POSIX_FADV_DONTNEED))
       warning("unable to posix_fadvise file %s (%s)", path, strerror(errno));
 #elif defined(__FreeBSD__) || defined(__sun__) || defined(__APPLE__)
@@ -590,6 +622,11 @@ void vmtouch_file(char *path) {
 
     if (o_verbose) {
       printf("%s\n", path);
+#ifdef __linux__
+      if (!can_do_mincore(&sb)) {
+        warning("Process does not have write permission, residency chart will not be accurate");
+      }
+#endif
       last_chart_print_time = gettimeofday_as_double();
       print_page_residency_chart(stdout, mincore_array, pages_in_range);
     }
@@ -663,7 +700,7 @@ static inline void add_object (struct stat *st)
 
 int is_ignored(const char* path) {
   char *path_copy;
-  int match;
+  int match, i;
 
   if (!number_of_ignores) return 0;
 
@@ -672,7 +709,7 @@ int is_ignored(const char* path) {
 
   char *filename = basename(path_copy);
 
-  for (int i = 0; i < number_of_ignores; i++) {
+  for (i = 0; i < number_of_ignores; i++) {
     if (fnmatch(ignore_list[i], filename, 0) == 0) {
       match = 1;
       break;
@@ -686,7 +723,7 @@ int is_ignored(const char* path) {
 
 int is_filename_filtered(const char* path) {
   char *path_copy;
-  int match;
+  int match, i;
 
   if (!number_of_filename_filters) return 1;
 
@@ -695,7 +732,7 @@ int is_filename_filtered(const char* path) {
 
   char *filename = basename(path_copy);
 
-  for (int i = 0; i < number_of_filename_filters; i++) {
+  for (i = 0; i < number_of_filename_filters; i++) {
     if (fnmatch(filename_filter_list[i], filename, 0) == 0) {
       match = 1;
       break;
@@ -861,7 +898,48 @@ static void vmtouch_batch_crawl(const char *path) {
   fclose(f);
 }
 
+static void remove_pidfile() {
+  int res = 0;
 
+  res = unlink(o_pidfile);
+  if (res < 0 && errno != ENOENT) {
+    warning("unable to remove pidfile %s (%s)", o_pidfile, strerror(errno));
+  }
+}
+
+static void write_pidfile() {
+  FILE *f = NULL;
+  size_t wrote = 0;
+
+  f = fopen(o_pidfile, "w");
+  if (!f) {
+    warning("unable to open pidfile %s (%s), skipping", o_pidfile, strerror(errno));
+    return;
+  }
+
+  wrote = fprintf(f, "%d\n", getpid());
+
+  fclose(f);
+
+  if (wrote < 0) {
+    warning("unable to write to pidfile %s (%s), deleting it", o_pidfile, strerror(errno));
+    remove_pidfile();
+  }
+}
+
+static void signal_handler_clear_pidfile(int signal_num) {
+  remove_pidfile();
+}
+
+static void register_signals_for_pidfile() {
+  struct sigaction sa = {0};
+  sa.sa_handler = signal_handler_clear_pidfile;
+  if (sigaction(SIGINT, &sa, NULL) < 0 ||
+      sigaction(SIGTERM, &sa, NULL) < 0 ||
+      sigaction(SIGQUIT, &sa, NULL) < 0) {
+    warning("unable to register signals for pidfile (%s), skipping", strerror(errno));
+  }
+}
 
 
 
@@ -879,7 +957,7 @@ int main(int argc, char **argv) {
 
   pagesize = sysconf(_SC_PAGESIZE);
 
-  while((ch = getopt(argc, argv,"tevqlLdfFh0i:I:p:b:m:w")) != -1) {
+  while((ch = getopt(argc, argv, "tevqlLdfFh0i:I:p:b:m:P:w")) != -1) {
     switch(ch) {
       case '?': usage(); break;
       case 't': o_touch = 1; break;
@@ -906,6 +984,7 @@ int main(int argc, char **argv) {
       case 'w': o_wait = 1; break;
       case 'b': o_batch = optarg; break;
       case '0': o_0_delim = 1; break;
+      case 'P': o_pidfile = optarg; break;
     }
   }
 
@@ -934,6 +1013,8 @@ int main(int argc, char **argv) {
 
   if (o_quiet && o_verbose) fatal("invalid option combination: -q and -v");
 
+  if (o_pidfile && (!o_lock && !o_lockall)) fatal("pidfile can only be created when -l or -L is specified");
+
   if (!argc && !o_batch) {
     printf("%s: no files or directories specified\n", prog);
     usage();
@@ -956,6 +1037,11 @@ int main(int argc, char **argv) {
     if (o_lockall) {
       if (mlockall(MCL_CURRENT))
         fatal("unable to mlockall (%s)", strerror(errno));
+    }
+
+    if (o_pidfile) {
+      register_signals_for_pidfile();
+      write_pidfile();
     }
 
     if (!o_quiet) printf("LOCKED %" PRId64 " pages (%s)\n", total_pages, pretty_print_size(total_pages*pagesize));
