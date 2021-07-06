@@ -125,6 +125,8 @@ void *seen_inodes = NULL;
 dev_t orig_device = 0;
 int orig_device_inited = 0;
 
+char topfile[3][2048];
+int topfile_pagenumgers[3] = {0};
 
 int o_touch=0;
 int o_evict=0;
@@ -504,6 +506,37 @@ static int can_do_mincore(struct stat *st) {
 #endif
 
 
+void update_topfilelist( int pagenumbers, char* path)
+{
+  int tmp;
+  char *tmppath;
+    // if(tmp > topfile_pagenumgers)
+    // {
+    //     topfile_pagenumgers = tmp;
+
+    //     strncpy(topfile,path,2048);
+
+    // }
+
+    for(int i = 0; i< 3; i++)
+    { 
+      if(pagenumbers > topfile_pagenumgers[i])
+      {
+          tmp = topfile_pagenumgers[i];
+          tmppath = topfile[i];
+
+          strncpy(topfile[i],path,2048);
+          topfile_pagenumgers[i] = pagenumbers;
+
+          path = tmppath; 
+          pagenumbers = tmp;
+
+      }
+      
+    }
+}
+
+
 void vmtouch_file(char *path) {
   int fd = -1;
   void *mem = NULL;
@@ -611,14 +644,25 @@ void vmtouch_file(char *path) {
     double last_chart_print_time=0.0, temp_time;
     char *mincore_array = malloc(pages_in_range);
     if (mincore_array == NULL) fatal("Failed to allocate memory for mincore array (%s)", strerror(errno));
-
+    int tmp = 0;
     // 3rd arg to mincore is char* on BSD and unsigned char* on linux
     if (mincore(mem, len_of_range, (void*)mincore_array)) fatal("mincore %s (%s)", path, strerror(errno));
     for (i=0; i<pages_in_range; i++) {
       if (is_mincore_page_resident(mincore_array[i])) {
         total_pages_in_core++;
+        tmp++;
+
       }
     }
+
+    update_topfilelist(tmp, path);
+    // if(tmp > topfile_pagenumgers)
+    // {
+    //     topfile_pagenumgers = tmp;
+
+    //     strncpy(topfile,path,2048);
+
+    // }
 
     if (o_verbose) {
       printf("%s\n", path);
@@ -1055,6 +1099,20 @@ int main(int argc, char **argv) {
 
   if (!o_quiet) {
     if (o_verbose) printf("\n");
+
+    for(int i = 0 ; i< 3 ; i++)
+    {
+      if((topfile_pagenumgers[i]) > 0)
+      {
+          if(i == 0)
+            printf("        TopFile: %s  Pages： %" PRId64 " (%s)\n", topfile[i],topfile_pagenumgers[i], pretty_print_size(topfile_pagenumgers[i]*pagesize) );
+          else
+            printf("                 %s  Pages： %" PRId64 " (%s)\n", topfile[i],topfile_pagenumgers[i], pretty_print_size(topfile_pagenumgers[i]*pagesize) );
+
+
+      }
+    }
+
     printf("           Files: %" PRId64 "\n", total_files);
     printf("     Directories: %" PRId64 "\n", total_dirs);
     if (o_touch)
